@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ===== МУТЕКС =====
 kernel32 = ctypes.windll.kernel32
-MUTEX_NAME = "Global\\MemoryScannerUniqueMutex_v14"
+MUTEX_NAME = "Global\\MemoryScannerUniqueMutex_v18"
 mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
 if kernel32.GetLastError() == 183:
     sys.exit(0)
@@ -200,6 +200,11 @@ class ScannerDataManager:
         self.history_index = -1
         self.max_history = 50
 
+        self.current_view_address = 0
+        self.current_view_types = list(SCAN_TYPES.keys())[:4]
+        self.current_edit_address = None
+        self.current_edit_type = None
+
         self.gui_update_queue = queue.Queue()
         self.bot_progress_queue = queue.Queue()
 
@@ -258,7 +263,7 @@ class TelegramBotManager:
         self.process_filter = ""
 
         self.progress_message = None
-        self.messages_to_delete = []  # Список сообщений для удаления
+        self.messages_to_delete = []
 
         if not self.bot_token:
             logger.warning("⚠️ BOT_TOKEN не найден в .env. Бот не запущен.")
@@ -281,10 +286,9 @@ class TelegramBotManager:
             return False
         return True
 
-    async def safe_send(self, message: Message, text: str, reply_markup=None, parse_mode="HTML", delete_old=False):
-        """Безопасная отправка с удалением старых сообщений"""
+    async def safe_send(self, message: Message, text: str, reply_markup=None, parse_mode="HTML", delete_old=False,
+                        remove_keyboard=False):
         try:
-            # Удаляем старые сообщения если нужно
             if delete_old and self.messages_to_delete:
                 for msg_id in self.messages_to_delete:
                     try:
@@ -293,32 +297,34 @@ class TelegramBotManager:
                         pass
                 self.messages_to_delete.clear()
 
+            if remove_keyboard:
+                reply_markup = ReplyKeyboardRemove()
+
             new_message = await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
             self.messages_to_delete.append(new_message.message_id)
             return new_message
         except TelegramRetryAfter as e:
             logger.warning(f"⏳ Flood wait {e.retry_after} сек")
             await asyncio.sleep(e.retry_after)
-            return await self.safe_send(message, text, reply_markup, parse_mode, delete_old)
+            return await self.safe_send(message, text, reply_markup, parse_mode, delete_old, remove_keyboard)
         except TelegramBadRequest as e:
-            logger.error(f"⚠️ Bad request: {e}")
+            logger.error(f"️ Bad request: {e}")
             return None
         except TelegramForbiddenError:
-            logger.warning(f" Пользователь заблокировал бота")
+            logger.warning(f"🚫 Пользователь заблокировал бота")
             return None
         except Exception as e:
             logger.error(f"❌ Ошибка отправки: {type(e).__name__} - {e}")
             return None
 
     async def safe_edit(self, message: Message, text: str, reply_markup=None, parse_mode="HTML"):
-        """Безопасное редактирование"""
         if message is None:
             return None
         try:
             await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             return message
         except TelegramRetryAfter as e:
-            logger.warning(f" Flood wait {e.retry_after} сек")
+            logger.warning(f"⏳ Flood wait {e.retry_after} сек")
             await asyncio.sleep(e.retry_after)
             return await self.safe_edit(message, text, reply_markup, parse_mode)
         except TelegramBadRequest as e:
@@ -327,16 +333,17 @@ class TelegramBotManager:
             logger.error(f"️ Ошибка редактирования: {e}")
             return None
         except Exception as e:
-            logger.error(f"❌ Ошибка редактирования: {type(e).__name__} - {e}")
+            logger.error(f" Ошибка редактирования: {type(e).__name__} - {e}")
             return None
 
     def _get_main_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статус", callback_data="status")],
             [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_scan")],
-            [InlineKeyboardButton(text=" Точное значение", callback_data="next_prompt"),
+            [InlineKeyboardButton(text="👁 Просмотр памяти", callback_data="view_memory_prompt")],
+            [InlineKeyboardButton(text="🎯 Точное значение", callback_data="next_prompt"),
              InlineKeyboardButton(text="📈 Изменилось", callback_data="changed")],
-            [InlineKeyboardButton(text="📊 Не изменилось", callback_data="unchanged"),
+            [InlineKeyboardButton(text=" Не изменилось", callback_data="unchanged"),
              InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh")],
             [InlineKeyboardButton(text="⏪ Назад", callback_data="back"),
              InlineKeyboardButton(text="⏩ Вперёд", callback_data="forward")],
@@ -354,7 +361,7 @@ class TelegramBotManager:
 
         keyboard = []
         if filter_text:
-            keyboard.append([InlineKeyboardButton(text=f" Фильтр: '{filter_text}'", callback_data="noop")])
+            keyboard.append([InlineKeyboardButton(text=f"🔍 Фильтр: '{filter_text}'", callback_data="noop")])
 
         for pid, name in page_processes:
             keyboard.append([InlineKeyboardButton(text=f"📱 {name} (PID: {pid})", callback_data=f"proc_{pid}")])
@@ -386,8 +393,8 @@ class TelegramBotManager:
                 ))
             keyboard.append(row)
         keyboard.append([InlineKeyboardButton(text="✅ Выбрать все", callback_data="types_all")])
-        keyboard.append([InlineKeyboardButton(text=" Далее", callback_data="types_done")])
-        keyboard.append([InlineKeyboardButton(text=" Отмена", callback_data="cancel")])
+        keyboard.append([InlineKeyboardButton(text="🔍 Далее", callback_data="types_done")])
+        keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
         return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     def _get_search_mode_keyboard(self) -> InlineKeyboardMarkup:
@@ -398,15 +405,13 @@ class TelegramBotManager:
         ])
 
     def _get_results_keyboard(self, results_list: list) -> InlineKeyboardMarkup:
-        """Создаёт клавиатуру с результатами для редактирования"""
         keyboard = []
-        # Показываем первые 10 результатов
         for i, (addr, type_key, val) in enumerate(results_list[:10]):
             t = SCAN_TYPES[type_key]
             val_str = f"{val:.4f}" if t['py'] == 'float' else str(val)
             keyboard.append([
                 InlineKeyboardButton(
-                    text=f" 0x{addr:X} [{t['name'][:20]}] = {val_str}",
+                    text=f"✏️ 0x{addr:X} ({t['size']} байт) = {val_str}",
                     callback_data=f"edit_{addr}_{type_key}"
                 )
             ])
@@ -417,12 +422,28 @@ class TelegramBotManager:
         keyboard.append([InlineKeyboardButton(text="↩️ Назад в меню", callback_data="back_to_menu")])
         return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+    def _get_memory_view_keyboard(self, address: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬆️ Выше (-256)", callback_data=f"mem_up_{address - 256}"),
+             InlineKeyboardButton(text="Ниже (+256) ⬇️", callback_data=f"mem_down_{address + 256}")],
+            [InlineKeyboardButton(text="️ Назад (-16)", callback_data=f"mem_up_{address - 16}"),
+             InlineKeyboardButton(text="Вперёд (+16) ️", callback_data=f"mem_down_{address + 16}")],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"mem_edit_{address}")],
+            [InlineKeyboardButton(text="↩️ Назад в меню", callback_data="back_to_menu")],
+        ])
+
     async def cmd_start(self, message: Message):
         if not self._check_access(message.from_user.id):
             return
 
-        # Очищаем клавиатуру ReplyKeyboard и старые сообщения
         self.messages_to_delete.clear()
+
+        # Удаляем ReplyKeyboard (кнопку "Отменить регистрацию")
+        await message.answer(
+            "🎮 <b>Memory Scanner v1.0</b>\n\nКлавиатура очищена.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
         status = self.data.get_status()
         text = (
@@ -435,7 +456,6 @@ class TelegramBotManager:
             f"Нажми кнопку ниже чтобы начать:"
         )
 
-        # Используем ReplyKeyboardRemove() для очистки кнопок под полем ввода
         await message.answer(
             text,
             parse_mode="HTML",
@@ -446,22 +466,23 @@ class TelegramBotManager:
         if not self._check_access(message.from_user.id):
             return
         text = (
-            " <b>Как использовать:</b>\n\n"
-            "1️⃣ Нажми <b>🔍 Новый поиск</b>\n"
-            "2️ Выбери процесс (кнопки ️➡️ для навигации)\n"
+            "📖 <b>Как использовать:</b>\n\n"
+            "1️ Нажми <b>🔍 Новый поиск</b>\n"
+            "2️ Выбери процесс (кнопки ⬅️➡️ для навигации)\n"
             "   • Или напиши имя процесса для поиска\n"
-            "3️ Выбери типы данных (галочки ✅)\n"
+            "3️⃣ Выбери типы данных (галочки ✅)\n"
             "4️⃣ Выбери режим поиска:\n"
             "   • <b>Да, знаю точное значение</b> — введи число\n"
             "   • <b>Нет, поиск неизвестного</b> — найдёт всё\n"
             "5️⃣ Следи за прогрессом (обновляется каждые 3 сек)\n"
             "6️⃣ После поиска нажми на адрес чтобы изменить значение\n"
-            "7️⃣ Фильтруй результаты:\n"
+            "7️⃣ Используй <b> Просмотр памяти</b> для просмотра любого адреса\n"
+            "8️⃣ Фильтруй результаты:\n"
             "   •  Изменилось\n"
             "   • 📊 Не изменилось\n"
             "   • 🔄 Обновить значения\n\n"
-            "8️⃣ Управляй историей: ⏪⏩\n"
-            "9️⃣ Замораживай значения: ❄️"
+            "9️⃣ Управляй историей: ⏪⏩\n"
+            "🔟 Замораживай значения: ️"
         )
         await self.safe_send(message, text, delete_old=True)
 
@@ -528,11 +549,29 @@ class TelegramBotManager:
             elif data == "back_to_menu":
                 await self.cmd_start(msg)
             elif data.startswith("edit_"):
-                # Обработка редактирования адреса: edit_ADDR_TYPEKEY
                 parts = data.split("_")
                 addr = int(parts[1], 16)
                 type_key = parts[2]
                 await self.edit_address_value(msg, addr, type_key)
+            elif data == "view_memory_prompt":
+                await self.ask_for_memory_address(msg)
+            elif data.startswith("mem_view_"):
+                address = int(data.split("_")[2])
+                await self.show_memory_view(msg, address)
+            elif data.startswith("mem_up_"):
+                address = int(data.split("_")[2])
+                await self.show_memory_view(msg, address)
+            elif data.startswith("mem_down_"):
+                address = int(data.split("_")[2])
+                await self.show_memory_view(msg, address)
+            elif data.startswith("mem_edit_"):
+                address = int(data.split("_")[2])
+                await self.ask_for_edit_type(msg, address)
+            elif data.startswith("mem_edit_type_"):
+                parts = data.split("_")
+                address = int(parts[2])
+                type_key = parts[3]
+                await self.edit_memory_value(msg, address, type_key)
             elif data == "noop":
                 pass
         except Exception as e:
@@ -548,6 +587,7 @@ class TelegramBotManager:
                         await message.reply("⏳ Сейчас идёт сканирование, подождите...")
                         return
 
+                # Проверяем, не имя ли это процесса
                 processes = get_processes()
                 if any(message.text.lower() in name.lower() for _, name in processes):
                     self.process_filter = message.text
@@ -555,16 +595,27 @@ class TelegramBotManager:
                     await self.show_process_selection(message)
                     return
 
+                # Проверяем, не адрес ли это для просмотра памяти (только если начинается с 0x)
+                addr_text = message.text.strip()
+                if addr_text.lower().startswith('0x'):
+                    try:
+                        addr = int(addr_text, 16)
+                        await self.show_memory_view(message, addr)
+                        return
+                    except ValueError:
+                        pass
+
+                # Иначе пытаемся выполнить поиск значения
                 value = message.text.strip()
-                float(value)
+                float(value)  # Проверка что это число
                 await self.perform_scan(message, value)
             except ValueError:
                 await self.safe_send(message,
-                                     "❌ Введите корректное число (например: 850000 или 15.5)\nИли имя процесса для поиска",
+                                     "❌ Введите корректное число (например: 850000 или 15.5)\nИли имя процесса для поиска\nИли адрес с 0x (например: 0x17EFF114)",
                                      delete_old=True)
             except Exception as e:
                 logger.error(f"❌ Ошибка обработки текста: {e}")
-                await self.safe_send(message, f"❌ Ошибка: {e}", delete_old=True)
+                await self.safe_send(message, f"❌ Ошибка: {str(e)}", delete_old=True)
 
     async def show_status(self, message: Message):
         status = self.data.get_status()
@@ -573,7 +624,7 @@ class TelegramBotManager:
             f"🎯 Процесс: <code>{status['process']}</code>\n"
             f"🔍 Типов данных: {status['types']}\n"
             f"📋 Результатов: {status['results']}\n"
-            f" История: {status['history']}\n"
+            f"📜 История: {status['history']}\n"
             f"❄️ Заморожено: {status['frozen']}\n"
             f"⏳ Сканирование: {'Да' if status['scanning'] else 'Нет'}"
         )
@@ -598,11 +649,11 @@ class TelegramBotManager:
                                      delete_old=True)
                 return
 
-            text = f" <b>Выбери процесс ({len(processes)} найдено):</b>\n"
+            text = f"📋 <b>Выбери процесс ({len(processes)} найдено):</b>\n"
             if self.process_filter:
-                text += f"\n Фильтр: <code>{self.process_filter}</code>\n"
+                text += f"\n🔍 Фильтр: <code>{self.process_filter}</code>\n"
             total_pages = (len(processes) + self.processes_per_page - 1) // self.processes_per_page
-            text += f"\nСтраница {self.process_page + 1} из {total_pages}\n\n <i>Напиши имя процесса для поиска</i>"
+            text += f"\nСтраница {self.process_page + 1} из {total_pages}\n\n💡 <i>Напиши имя процесса для поиска</i>"
 
             await self.safe_send(message, text,
                                  self._get_process_keyboard(processes, self.process_page, self.process_filter),
@@ -669,7 +720,7 @@ class TelegramBotManager:
 
     async def ask_for_value(self, message: Message):
         await self.safe_send(message,
-                             " <b>Введите значение для поиска:</b>\n\nМожно вводить:\n• Целые числа: 850000\n• Дробные: 15.5\n• С точкой: 3.14\n\nПросто отправь число:",
+                             "🔢 <b>Введите значение для поиска:</b>\n\nМожно вводить:\n• Целые числа: 850000\n• Дробные: 15.5\n• С точкой: 3.14\n\nПросто отправь число:",
                              delete_old=True)
 
     async def ask_for_next_value(self, message: Message):
@@ -677,8 +728,132 @@ class TelegramBotManager:
             if not self.data.scan_results:
                 await self.safe_send(message, "❌ Сначала выполни поиск!", delete_old=True)
                 return
-        await self.safe_send(message, " <b>Введите новое точное значение:</b>\n\nПросто отправь число:",
+        await self.safe_send(message, "🎯 <b>Введите новое точное значение:</b>\n\nПросто отправь число:",
                              delete_old=True)
+
+    async def ask_for_memory_address(self, message: Message):
+        await self.safe_send(message, "👁 <b>Просмотр памяти</b>\n\nВведите адрес в hex с 0x (например: 0x17EFF114):",
+                             delete_old=True)
+
+    async def show_memory_view(self, message: Message, address: int):
+        try:
+            with self.data.lock:
+                if not self.data.pm:
+                    await self.safe_send(message, " Сначала выбери процесс!", delete_old=True)
+                    return
+
+                pm = self.data.pm
+                types_to_show = self.data.current_view_types
+
+            read_start = max(0, address - 128)
+            read_size = 256
+
+            try:
+                data = pm.read_bytes(read_start, read_size)
+            except Exception as e:
+                await self.safe_send(message, f"❌ Не удалось прочитать память: {str(e)}", delete_old=True)
+                return
+
+            text = f" <b>Просмотр памяти</b>\n\n"
+            text += f"📍 Базовый адрес: <code>0x{address:X}</code>\n\n"
+
+            lines = []
+            for i in range(16):
+                offset = i * 16
+                if offset >= len(data):
+                    break
+
+                line_addr = read_start + offset
+                line_bytes = data[offset:offset + 16]
+
+                hex_str = ' '.join(f'{b:02X}' for b in line_bytes)
+
+                values = []
+                for type_key in types_to_show:
+                    t = SCAN_TYPES[type_key]
+                    if offset + t['size'] <= len(line_bytes):
+                        val = read_value(type_key, line_bytes, 0)
+                        if val is not None:
+                            if t['py'] == 'float':
+                                values.append(f"{t['size']}Б: {val:.4f}")
+                            else:
+                                values.append(f"{t['size']}Б: {val}")
+
+                values_str = ' | '.join(values) if values else 'N/A'
+                lines.append(f"<code>0x{line_addr:X}</code> | {hex_str:<48} | {values_str}")
+
+            text += '\n'.join(lines[:16])
+
+            types_str = ', '.join(f"{SCAN_TYPES[t]['size']} байт" for t in types_to_show)
+            text += f"\n\n<i>Показаны типы: {types_str}</i>"
+
+            keyboard = self._get_memory_view_keyboard(address)
+            await self.safe_send(message, text, keyboard, delete_old=True)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка show_memory_view: {e}")
+            await self.safe_send(message, f" Ошибка: {str(e)}", delete_old=True)
+
+    async def ask_for_edit_type(self, message: Message, address: int):
+        try:
+            with self.data.lock:
+                if not self.data.pm:
+                    await self.safe_send(message, " Сначала выбери процесс!", delete_old=True)
+                    return
+
+            text = f"✏️ <b>Редактирование адреса 0x{address:X}</b>\n\n"
+            text += "Выберите тип данных для редактирования:\n\n"
+
+            keyboard = []
+            for key, info in list(SCAN_TYPES.items())[:8]:
+                keyboard.append([InlineKeyboardButton(
+                    text=f"{info['name']}",
+                    callback_data=f"mem_edit_type_{address}_{key}"
+                )])
+
+            keyboard.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"mem_view_{address}")])
+
+            await self.safe_send(message, text, InlineKeyboardMarkup(inline_keyboard=keyboard), delete_old=True)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка ask_for_edit_type: {e}")
+
+    async def edit_memory_value(self, message: Message, address: int, type_key: str):
+        try:
+            t = SCAN_TYPES[type_key]
+
+            with self.data.lock:
+                if not self.data.pm:
+                    await self.safe_send(message, "❌ Сначала выбери процесс!", delete_old=True)
+                    return
+
+                try:
+                    data = self.data.pm.read_bytes(address, t['size'])
+                    current_val = read_value(type_key, data, 0)
+                    if current_val is not None:
+                        current_str = f"{current_val:.6f}" if t['py'] == 'float' else str(current_val)
+                    else:
+                        current_str = "N/A"
+                except:
+                    current_str = "N/A"
+
+            text = (
+                f"✏️ <b>Редактирование</b>\n\n"
+                f"📍 Адрес: <code>0x{address:X}</code>\n"
+                f"📊 Тип: {t['name']}\n"
+                f"💾 Текущее: <code>{current_str}</code>\n\n"
+                f"<b>Введите новое значение:</b>\n"
+                f"<i>Диапазон: {t['min']} до {t['max']}</i>"
+            )
+
+            await self.safe_send(message, text, delete_old=True)
+
+            self.data.current_edit_address = address
+            self.data.current_edit_type = type_key
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка edit_memory_value: {e}")
+            await self.safe_send(message, f"❌ Ошибка: {str(e)}", delete_old=True)
 
     async def perform_scan(self, message: Message, search_value: str):
         try:
@@ -699,7 +874,7 @@ class TelegramBotManager:
 
             threading.Thread(target=self._do_scan_thread, args=(search_value, False), daemon=True).start()
         except Exception as e:
-            logger.error(f" Ошибка perform_scan: {e}")
+            logger.error(f"❌ Ошибка perform_scan: {e}")
             with self.data.lock:
                 self.data.is_scanning = False
 
@@ -716,7 +891,7 @@ class TelegramBotManager:
                 'value': 'неизвестное'
             })
 
-            progress_msg = await self.safe_send(message, "🔍 <b>Поиск неизвестного значения</b>\n\n⏳ Подготовка...",
+            progress_msg = await self.safe_send(message, "🔍 <b>Поиск неизвестного значения</b>\n\n Подготовка...",
                                                 delete_old=True)
             self.progress_message = progress_msg
 
@@ -787,11 +962,11 @@ class TelegramBotManager:
                                                                                                   1)) * 100)
 
                         progress_text = (
-                            f" <b>Сканирование...</b>\n\n"
+                            f"🔍 <b>Сканирование...</b>\n\n"
                             f"📊 <b>Прогресс:</b> {percent:.1f}%\n"
-                            f" Скорость: {speed_mb:.1f} MB/s\n"
-                            f" Регионов: {regions_checked}/{total_regions}\n"
-                            f"💾 Найдено: {total_entries} записей\n"
+                            f"⚡ Скорость: {speed_mb:.1f} MB/s\n"
+                            f"📁 Регионов: {regions_checked}/{total_regions}\n"
+                            f" Найдено: {total_entries} записей\n"
                             f"⏱ Время: {elapsed:.1f} сек"
                         )
 
@@ -843,10 +1018,10 @@ class TelegramBotManager:
             result_text = (
                 f"✅ <b>Поиск завершён!</b>\n\n"
                 f"📊 Найдено: <b>{total_entries}</b> записей\n"
-                f"⏱ Время: {elapsed:.1f} сек\n"
+                f" Время: {elapsed:.1f} сек\n"
                 f"⚡ Скорость: {speed:.1f} MB/s\n"
                 f"💾 Просканировано: {mb:.1f} MB\n"
-                f" Регионов: {regions_checked}\n\n"
+                f"🔍 Регионов: {regions_checked}\n\n"
                 f"<i>Нажми на адрес чтобы изменить значение</i>"
             )
 
@@ -870,7 +1045,7 @@ class TelegramBotManager:
 
             self.data.bot_progress_queue.put({
                 'type': 'error',
-                'text': f"❌ Ошибка сканирования: {e}"
+                'text': f"❌ Ошибка сканирования: {str(e)}"
             })
 
             self.data.gui_update_queue.put({
@@ -905,7 +1080,6 @@ class TelegramBotManager:
                 await asyncio.sleep(1)
 
     async def edit_address_value(self, message: Message, addr: int, type_key: str):
-        """Редактирование значения по адресу"""
         try:
             t = SCAN_TYPES[type_key]
 
@@ -919,21 +1093,18 @@ class TelegramBotManager:
 
             await self.safe_send(
                 message,
-                f"️ <b>Редактирование значения</b>\n\n"
-                f"📍 Адрес: <code>0x{addr:X}</code>\n"
+                f"✏️ <b>Редактирование значения</b>\n\n"
+                f"📍 Адрес: <code>0x{addr:X}</code> ({t['size']} байт)\n"
                 f"📊 Тип: {t['name']}\n"
-                f" Текущее: <code>{val_str}</code>\n\n"
-                f"<b>Введите новое значение:</b>",
+                f"💾 Текущее: <code>{val_str}</code>\n\n"
+                f"<b>Введите новое значение:</b>\n"
+                f"<i>Диапазон: {t['min']} до {t['max']}</i>",
                 delete_old=True
             )
 
-            # Ждём ввод нового значения
-            # Это упрощённая версия — в реальном боте нужно использовать FSM
-            # Для простоты просто отправляем сообщение что нужно ввести значение
-
         except Exception as e:
             logger.error(f"❌ Ошибка edit_address_value: {e}")
-            await self.safe_send(message, f"❌ Ошибка: {e}", delete_old=True)
+            await self.safe_send(message, f"❌ Ошибка: {str(e)}", delete_old=True)
 
     async def filter_changed(self, message: Message):
         try:
@@ -979,11 +1150,11 @@ class TelegramBotManager:
 
                     self.data.gui_update_queue.put({'type': 'results_updated'})
 
-                    result_text = f"✅ <b>Фильтрация завершена</b>\n\n Изменилось: <b>{changed}</b>\n📊 Не изменилось: {unchanged}\n\n<b>Осталось:</b> {total}"
+                    result_text = f"✅ <b>Фильтрация завершена</b>\n\n🔴 Изменилось: <b>{changed}</b>\n📊 Не изменилось: {unchanged}\n\n<b>Осталось:</b> {total}"
                     self.data.bot_progress_queue.put({'type': 'result', 'text': result_text})
                 except Exception as e:
                     logger.error(f"❌ Ошибка filter_changed: {e}")
-                    self.data.bot_progress_queue.put({'type': 'error', 'text': f"❌ Ошибка: {e}"})
+                    self.data.bot_progress_queue.put({'type': 'error', 'text': f"❌ Ошибка: {str(e)}"})
 
             threading.Thread(target=do_filter, daemon=True).start()
         except Exception as e:
@@ -996,7 +1167,7 @@ class TelegramBotManager:
                     await self.safe_send(message, "❌ Нет результатов!", delete_old=True)
                     return
 
-            progress_msg = await self.safe_send(message, " <b>Фильтрация: ищем неизменившиеся...</b>", delete_old=True)
+            progress_msg = await self.safe_send(message, "🔄 <b>Фильтрация: ищем неизменившиеся...</b>", delete_old=True)
             self.progress_message = progress_msg
 
             def do_filter():
@@ -1031,7 +1202,7 @@ class TelegramBotManager:
                     self.data.bot_progress_queue.put({'type': 'result', 'text': result_text})
                 except Exception as e:
                     logger.error(f"❌ Ошибка filter_unchanged: {e}")
-                    self.data.bot_progress_queue.put({'type': 'error', 'text': f"❌ Ошибка: {e}"})
+                    self.data.bot_progress_queue.put({'type': 'error', 'text': f" Ошибка: {str(e)}"})
 
             threading.Thread(target=do_filter, daemon=True).start()
         except Exception as e:
@@ -1081,11 +1252,11 @@ class TelegramBotManager:
 
                     self.data.gui_update_queue.put({'type': 'results_updated'})
 
-                    result_text = f"✅ <b>Обновлено</b>\n\n Изменилось: {changed}\n Не изменилось: {unchanged}\n⚠️ Ошибок: {errors}"
+                    result_text = f"✅ <b>Обновлено</b>\n\n🔴 Изменилось: {changed}\n Не изменилось: {unchanged}\n️ Ошибок: {errors}"
                     self.data.bot_progress_queue.put({'type': 'result', 'text': result_text})
                 except Exception as e:
-                    logger.error(f" Ошибка refresh_values: {e}")
-                    self.data.bot_progress_queue.put({'type': 'error', 'text': f"❌ Ошибка: {e}"})
+                    logger.error(f"❌ Ошибка refresh_values: {e}")
+                    self.data.bot_progress_queue.put({'type': 'error', 'text': f"❌ Ошибка: {str(e)}"})
 
             threading.Thread(target=do_refresh, daemon=True).start()
         except Exception as e:
@@ -1096,7 +1267,7 @@ class TelegramBotManager:
             desc = self.data.go_back()
             if desc:
                 self.data.gui_update_queue.put({'type': 'results_updated'})
-                await self.safe_send(message, f" {desc}", self._get_main_keyboard(), delete_old=True)
+                await self.safe_send(message, f"⏪ {desc}", self._get_main_keyboard(), delete_old=True)
             else:
                 await self.safe_send(message, "❌ Нельзя вернуться дальше", delete_old=True)
         except Exception as e:
@@ -1111,7 +1282,7 @@ class TelegramBotManager:
             else:
                 await self.safe_send(message, "❌ Нельзя перейти вперёд", delete_old=True)
         except Exception as e:
-            logger.error(f" Ошибка go_forward: {e}")
+            logger.error(f"❌ Ошибка go_forward: {e}")
 
     async def show_results(self, message: Message):
         try:
@@ -1121,7 +1292,6 @@ class TelegramBotManager:
                     return
                 results_copy = copy.deepcopy(self.data.scan_results)
 
-            # Создаём список результатов для кнопок
             results_list = []
             for addr in sorted(results_copy.keys()):
                 for type_key in sorted(results_copy[addr].keys()):
@@ -1131,11 +1301,10 @@ class TelegramBotManager:
             text = f"📋 <b>Результаты ({len(results_list)} записей):</b>\n\n"
             text += "<i>Нажми на адрес чтобы изменить значение</i>\n\n"
 
-            # Показываем первые 5 результатов в тексте
             for i, (addr, type_key, val) in enumerate(results_list[:5]):
                 t = SCAN_TYPES[type_key]
                 val_str = f"{val:.4f}" if t['py'] == 'float' else str(val)
-                text += f"<code>0x{addr:X}</code> [{t['name']}] = {val_str}\n"
+                text += f"<code>0x{addr:X}</code> ({t['size']} байт) = {val_str}\n"
 
             if len(results_list) > 5:
                 text += f"\n...и ещё {len(results_list) - 5}"
@@ -1170,7 +1339,7 @@ class TelegramBotManager:
                                  "❄️ <b>Заморозка значения</b>\n\nОтправь в формате:\n<code>адрес_hex значение</code>\n\nПример:\n<code>14742278 9999</code>",
                                  delete_old=True)
         except Exception as e:
-            logger.error(f"❌ Ошибка ask_for_freeze: {e}")
+            logger.error(f" Ошибка ask_for_freeze: {e}")
 
     async def unfreeze_all(self, message: Message):
         try:
@@ -1181,9 +1350,9 @@ class TelegramBotManager:
                 self.data.freeze_threads.clear()
 
             self.data.gui_update_queue.put({'type': 'results_updated'})
-            await self.safe_send(message, "🔓 <b>Все адреса разморожены</b>", self._get_main_keyboard(), delete_old=True)
+            await self.safe_send(message, " <b>Все адреса разморожены</b>", self._get_main_keyboard(), delete_old=True)
         except Exception as e:
-            logger.error(f"❌ Ошибка unfreeze_all: {e}")
+            logger.error(f" Ошибка unfreeze_all: {e}")
 
     async def cancel_operation(self, message: Message):
         try:
@@ -1193,7 +1362,7 @@ class TelegramBotManager:
             self.data.gui_update_queue.put({'type': 'scan_cancelled'})
             await self.safe_send(message, "❌ <b>Операция отменена</b>", self._get_main_keyboard(), delete_old=True)
         except Exception as e:
-            logger.error(f" Ошибка cancel_operation: {e}")
+            logger.error(f"❌ Ошибка cancel_operation: {e}")
 
     def start(self):
         if not self.bot_token:
@@ -1201,7 +1370,7 @@ class TelegramBotManager:
 
         async def main():
             me = await self.bot.get_me()
-            logger.info(f"🤖 Бот запущен: @{me.username} (ID: {me.id})")
+            logger.info(f" Бот запущен: @{me.username} (ID: {me.id})")
 
             progress_task = asyncio.create_task(self._progress_updater())
 
@@ -1280,7 +1449,7 @@ class MemoryScannerApp:
                 self.search_var.set(update['value'])
                 self.progress_var.set(0)
                 self.progress_label.config(
-                    text=f"🔍 Поиск: {update['value']}...",
+                    text=f" Поиск: {update['value']}...",
                     foreground='#f57c00'
                 )
 
@@ -1335,7 +1504,7 @@ class MemoryScannerApp:
         self.status_msg.pack(pady=5)
 
     def on_run_as_admin(self):
-        self.status_msg.config(text=" Запуск...", foreground='#1976d2')
+        self.status_msg.config(text="⏳ Запуск...", foreground='#1976d2')
         self.root.update()
         success, error = restart_as_admin()
         if not success:
@@ -1360,7 +1529,7 @@ class MemoryScannerApp:
                                            font=('Segoe UI', 9, 'bold'))
         self.proc_status_label.pack(side='left', padx=10)
 
-        self.admin_label = ttk.Label(top_frame, text="🔑 Админ: ✅" if self.admin_ok else "⚠️ Админ: ",
+        self.admin_label = ttk.Label(top_frame, text="🔑 Админ: ✅" if self.admin_ok else "⚠️ Админ: ❌",
                                      font=('Segoe UI', 9, 'bold'), foreground='#2e7d32' if self.admin_ok else '#f57c00')
         self.admin_label.pack(side='right', padx=5)
 
@@ -1382,8 +1551,8 @@ class MemoryScannerApp:
         self.proc_listbox.config(yscrollcommand=lambda f, l: self.proc_listbox.yview)
 
         ttk.Button(self.proc_panel, text="✅ Выбрать", command=self.on_process_select).pack(side='left', padx=8, pady=5)
-        ttk.Button(self.proc_panel, text=" Закрыть", command=self.toggle_process_panel).pack(side='right', padx=8,
-                                                                                             pady=5)
+        ttk.Button(self.proc_panel, text="❌ Закрыть", command=self.toggle_process_panel).pack(side='right', padx=8,
+                                                                                              pady=5)
         self.refresh_processes()
 
         search_frame = ttk.LabelFrame(self.root, text="Параметры поиска", padding=8)
@@ -1412,15 +1581,15 @@ class MemoryScannerApp:
         filter_frame.pack(fill='x', pady=5)
         self.btn_back = ttk.Button(filter_frame, text="⏪ Назад", command=self.go_back, state='disabled')
         self.btn_back.pack(side='left', padx=2)
-        self.btn_forward = ttk.Button(filter_frame, text=" Вперёд", command=self.go_forward, state='disabled')
+        self.btn_forward = ttk.Button(filter_frame, text="⏩ Вперёд", command=self.go_forward, state='disabled')
         self.btn_forward.pack(side='left', padx=2)
-        ttk.Button(filter_frame, text=" Точное", command=self.next_scan_exact).pack(side='left', padx=2)
+        ttk.Button(filter_frame, text="🎯 Точное", command=self.next_scan_exact).pack(side='left', padx=2)
         ttk.Button(filter_frame, text=" Изменилось", command=self.filter_changed).pack(side='left', padx=2)
-        ttk.Button(filter_frame, text=" Не изм.", command=self.filter_unchanged).pack(side='left', padx=2)
-        self.btn_refresh = ttk.Button(filter_frame, text=" Обновить", command=self.refresh_values)
+        ttk.Button(filter_frame, text="📊 Не изм.", command=self.filter_unchanged).pack(side='left', padx=2)
+        self.btn_refresh = ttk.Button(filter_frame, text="🔄 Обновить", command=self.refresh_values)
         self.btn_refresh.pack(side='left', padx=2)
         ttk.Button(filter_frame, text="🗑 Сброс", command=self.reset_results).pack(side='left', padx=2)
-        self.history_label = ttk.Label(filter_frame, text="📜 0/0", foreground='#666')
+        self.history_label = ttk.Label(filter_frame, text=" 0/0", foreground='#666')
         self.history_label.pack(side='right', padx=10)
 
         progress_frame = ttk.Frame(search_frame)
@@ -1451,16 +1620,16 @@ class MemoryScannerApp:
         result_btn_frame = ttk.Frame(bottom_frame)
         result_btn_frame.pack(fill='x', pady=5)
         ttk.Button(result_btn_frame, text="✏️ Записать", command=self.write_selected).pack(side='left', padx=2)
-        ttk.Button(result_btn_frame, text="️ Заморозить", command=self.freeze_selected).pack(side='left', padx=2)
+        ttk.Button(result_btn_frame, text="❄️ Заморозить", command=self.freeze_selected).pack(side='left', padx=2)
         ttk.Button(result_btn_frame, text="🔓 Разморозить", command=self.unfreeze_selected).pack(side='left', padx=2)
-        ttk.Button(result_btn_frame, text="📋 Копировать", command=self.copy_address).pack(side='left', padx=2)
+        ttk.Button(result_btn_frame, text=" Копировать", command=self.copy_address).pack(side='left', padx=2)
         self.result_count = ttk.Label(result_btn_frame, text="Адресов: 0", font=('Segoe UI', 9, 'bold'))
         self.result_count.pack(side='right', padx=10)
 
     def toggle_process_panel(self):
         if self.process_panel_visible:
             self.proc_panel.pack_forget()
-            self.proc_btn.config(text=" Процессы")
+            self.proc_btn.config(text="📋 Процессы")
             self.process_panel_visible = False
         else:
             self.proc_panel.pack(fill='x', padx=8, pady=3)
@@ -1609,7 +1778,7 @@ class MemoryScannerApp:
             if not self.data.scan_results:
                 return
         self.btn_refresh.config(state='disabled')
-        self.progress_label.config(text="🔄 Обновление...", foreground='#f57c00')
+        self.progress_label.config(text=" Обновление...", foreground='#f57c00')
         threading.Thread(target=self._do_refresh_values, daemon=True).start()
 
     def _do_refresh_values(self):
@@ -1918,8 +2087,10 @@ class MemoryScannerApp:
     def copy_address(self):
         selection = self.tree.selection()
         if selection:
+            item = self.tree.item(selection[0])
+            addr = item['values'][0]
             self.root.clipboard_clear()
-            self.root.clipboard_append(self.tree.item(selection[0])['values'][0])
+            self.root.clipboard_append(f"{addr}")
 
 
 # ===== ЗАПУСК =====
